@@ -1,4 +1,4 @@
-# SMA2 BGID Editor by Oquendo
+# SMA2 Layer 2 / BGID Editor by Oquendo
 
 A command-line tool to edit Layer 2 background IDs, tilemap pointers, and visual header
 fields in **Super Mario Advance 2: Super Mario World** (GBA, game code `AA2E`).
@@ -22,9 +22,17 @@ see the [BG/FG risk section](#bgfg-coupling-and-risks) to understand why.
 
 ## Usage
 
-```
-python sma2_bgid_editor.py <rom.gba> <command> [args] [options]
-```
+![Before/after example](assets/image.png)
+
+---
+
+## Before / After
+
+![Before](assets/before.png)
+
+![After](assets/after.png)
+
+---
 
 The original ROM is **never modified**. All output goes to `<rom>_edited.gba`.
 If the file already ends in `_edited`, it is overwritten in place.
@@ -491,15 +499,3 @@ python sma2_bgid_editor.py sma2.gba set 0x05 0x11 --keep-ptr
 # Bulk-change multiple levels at once (no prompts, only BGID + pointer updated)
 python sma2_bgid_editor.py sma2.gba batch 0x05=0x11 0x06=0x0A 0x07=0x00
 ```
-
-## License
-
-This project is licensed under the MIT License - see below for details:
-
-**Copyright (c) 2026 Oquendo**
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
