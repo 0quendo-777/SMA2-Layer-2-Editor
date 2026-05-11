@@ -33,10 +33,8 @@ see the [BG/FG risk section](#bgfg-coupling-and-risks) to understand why.
 ![After](assets/after.png)
 
 ---
-Command used: `python sma2_bgid_editor.py sma2.gba set 0x05 0x07`
 
-The original ROM is **never modified**. All output goes to `<rom>_edited.gba`.
-If the file already ends in `_edited`, it is overwritten in place.
+All edits are written **directly to the ROM file you pass in** — in-place. Make a backup of your original ROM before editing.
 
 The banner (version info and quick-start guide) is only shown when you run the script
 with no arguments. Running any command prints only that command's output.

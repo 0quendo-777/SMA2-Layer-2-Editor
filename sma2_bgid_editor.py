@@ -66,7 +66,7 @@ def print_banner():
     border = f"{C.INFO}  {'─' * 44}{C.RESET}"
     print(logo)
     print(border)
-    print(f"  {ok('Version')} : v0.1          {info('Author')} : Oquendo")
+    print(f"  {ok('Version')} : v0.2          {info('Author')} : Oquendo")
     print(f"  {ok('ROM')}     : Super Mario Advance 2 (GBA)")
     print(border)
     print(f"""
@@ -80,7 +80,7 @@ def print_banner():
 
     {opt('3.')} Set a new background (e.g. Castle 1 = BGID 0x06):
        {C.SUCCESS}python sma2_bgid_editor.py sma2.gba set 0x05 0x07{C.RESET}
-       {C.INFO}→ Saves as sma2_edited.gba — original ROM is never touched{C.RESET}
+       {C.INFO}→ Edits sma2.gba directly in-place{C.RESET}
 
     {opt('4.')} Batch-edit multiple levels at once:
        {C.SUCCESS}python sma2_bgid_editor.py sma2.gba batch 0x05=0x06 0x06=0x0D{C.RESET}
@@ -511,10 +511,7 @@ def check_rom(data: bytes) -> bool:
  
  
 def out_path_for(rom_path: Path) -> Path:
-    stem = rom_path.stem
-    if stem.endswith("_edited"):
-        return rom_path
-    return rom_path.with_name(stem + "_edited" + rom_path.suffix)
+    return rom_path  # always write back in-place
  
  
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -689,7 +686,7 @@ def cmd_set(data: bytearray, level_id: int, new_bgid: int,
                 print(err("\n  Header    -> could not be written (skipped)"))
 
     out_path.write_bytes(bytes(data))
-    print(ok(f"\n  Saved to: {out_path}\n"))
+    print(ok(f"\n  Modified in-place: {out_path}\n"))
     return True
  
  
@@ -704,7 +701,7 @@ def cmd_batch(data: bytearray, changes: list, out_path: Path, keep_ptr: bool = F
             applied += 1
     if applied:
         out_path.write_bytes(bytes(data))
-        print(ok(f"\n  {applied} change(s) applied. Saved to: {out_path}\n"))
+        print(ok(f"\n  {applied} change(s) applied. Modified in-place: {out_path}\n"))
     else:
         print(err("  No changes applied.\n"))
  
@@ -734,7 +731,7 @@ Notes on level_id:
   - 0x01-0x5A  -> sublevel = level_id + 0x100  (overworld levels)
   - 0xB7-0xFF  -> sublevel = level_id  (bosses / special rooms)
  
-Output: <rom>_edited.gba  (original ROM is never modified)
+Output: same .gba file modified in-place
  
 Examples:
   python sma2_bgid_editor.py sma2.gba info
