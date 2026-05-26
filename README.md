@@ -4,6 +4,8 @@
 
 A command-line tool to edit Layer 2 background IDs, tilemap pointers, and visual header fields in Super Mario Advance 2. All edits are written directly to your working ROM.
 
+![SMA2 BG Editor](assets/image.png)
+
 ---
 
 ## Table of Contents
@@ -45,6 +47,12 @@ Every write command modifies your ROM **in-place** — the same file you pass in
 ## Main Commands
 
 These commands cover the most common editing tasks.
+
+## Before / After
+
+![Before](assets/before.png)
+
+![After](assets/after.png)
 
 ### `info` — List all backgrounds
 
