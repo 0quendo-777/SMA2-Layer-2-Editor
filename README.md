@@ -54,6 +54,8 @@ These commands cover the most common editing tasks.
 
 ![After](assets/after.png)
 
+**Command used:** `python sma2_bgid_editor.py sma2.gba set 0x105 0x07`
+
 ### `info` — List all backgrounds
 
 ```
