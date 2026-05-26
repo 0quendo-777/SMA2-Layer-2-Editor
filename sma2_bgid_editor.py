@@ -1,13 +1,12 @@
 """
 SMA2 (Super Mario Advance 2) - Layer 2 / Background ID Editor by Oquendo
 =========================================================================================
-Reads and modifies the Layer 2 BGID for each level in the ROM.
+Reads and modifies the Layer 2 BGID for each sublevel in the ROM.
 When changing a BGID, also updates the L2 tilemap pointer AND the
 level header (BG palette, FG palette, sprite palette, tileset ID,
 BG color) to match the new background automatically.
 Use --keep-ptr to skip the L2 pointer update.
-Use --keep-header to skip the header palette/tileset update.
- 
+
 ROM tables (verified against ROM map and real edits):
   BGID table   : 0x0F3B38 - 0x0F3D40  (0x209 entries, 1 byte each)
                  GBA: 0x080F3B38 | sublevel IDs 0x000-0x208
@@ -15,42 +14,34 @@ ROM tables (verified against ROM map and real edits):
   Layout ptrs  : 0x0F2AF0 - 0x0F3313  (0x209 entries, 4 bytes each)
                  GBA: 0x080F2AF0 | same sublevel index
                  Spot-check: sublevel 0x105 -> offset 0x0F2F04
- 
-  All 'Length' values in the ROM map are in hex.
-  End addresses are exclusive (last valid byte = end - 1).
- 
+
 Intentional vanilla mismatches (original game overrides):
   Sublevel 0x108: BGID=0x0A, L2 ptr -> YI Mountains tilemap instead of Beta Mountains
   Sublevel 0x112: BGID=0x00, L2 ptr -> Chocolate Island tilemap instead of YI Mountains
   The script flags these on read but overwrites them on write
   (use --keep-ptr to preserve a custom pointer).
- 
-level_id -> sublevel_id mapping:
-  level 0x00       -> sublevel 0x000  (Bonus game, special case)
-  levels 0x01-0x5A -> sublevel = level_id + 0x100  (overworld levels)
-  everything else  -> sublevel = level_id  (bosses, internal rooms, CI2 sublevels)
 """
 
 import sys
 import struct
 from pathlib import Path
 
-# Force UTF-8 output on Windows (avoids cp1252 UnicodeEncodeError with box-drawing chars)
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-# ── Pastel terminal colors ────────────────────────────────────────────────────
 class C:
-    SUCCESS = "\033[38;2;180;235;180m"   # pastel green  — saved / OK
-    INFO    = "\033[38;2;180;210;255m"   # pastel blue   — labels / neutral info
-    OPTION  = "\033[38;2;255;220;180m"   # pastel orange — menus / palette choices
-    ERROR   = "\033[38;2;255;180;180m"   # pastel red    — warnings / errors
+    SUCCESS = "\033[38;2;180;230;210m"   # pastel mint / teal-green
+    INFO    = "\033[38;2;255;200;220m"   # pastel rose / pink
+    OPTION  = "\033[38;2;255;235;150m"   # pastel golden yellow
+    ERROR   = "\033[38;2;255;160;130m"   # pastel coral / salmon
+    HEADER  = "\033[38;2;150;220;255m"   # pastel sky blue
     RESET   = "\033[0m"
 
-def ok(msg):    return f"{C.SUCCESS}{msg}{C.RESET}"
-def info(msg):  return f"{C.INFO}{msg}{C.RESET}"
-def opt(msg):   return f"{C.OPTION}{msg}{C.RESET}"
-def err(msg):   return f"{C.ERROR}{msg}{C.RESET}"
+def ok(msg):   return f"{C.SUCCESS}{msg}{C.RESET}"
+def info(msg): return f"{C.INFO}{msg}{C.RESET}"
+def opt(msg):  return f"{C.OPTION}{msg}{C.RESET}"
+def err(msg):  return f"{C.ERROR}{msg}{C.RESET}"
+def hdr(msg):  return f"{C.HEADER}{msg}{C.RESET}"
 
 
 def print_banner():
@@ -66,78 +57,50 @@ def print_banner():
     border = f"{C.INFO}  {'─' * 44}{C.RESET}"
     print(logo)
     print(border)
-    print(f"  {ok('Version')} : v0.2          {info('Author')} : Oquendo")
+    print(f"  {ok('Version')} : v0.3          {info('Author')} : Oquendo")
     print(f"  {ok('ROM')}     : Super Mario Advance 2 (GBA)")
     print(border)
     print(f"""
-  {info('Quick start')} — Change background of level 0x05 (Yoshi's Island 1):
+  {hdr('Quick start')} — Change background of sublevel 0x105 (Yoshi's Island 1):
 
     {opt('1.')} List all available backgrounds and their IDs:
        {C.SUCCESS}python sma2_bgid_editor.py sma2.gba info{C.RESET}
 
-    {opt('2.')} Check current background of level 0x05:
-       {C.SUCCESS}python sma2_bgid_editor.py sma2.gba get 0x05{C.RESET}
+    {opt('2.')} Check current background of sublevel 0x105:
+       {C.SUCCESS}python sma2_bgid_editor.py sma2.gba get 0x105{C.RESET}
 
-    {opt('3.')} Set a new background (e.g. Castle 1 = BGID 0x06):
-       {C.SUCCESS}python sma2_bgid_editor.py sma2.gba set 0x05 0x07{C.RESET}
+    {opt('3.')} Set a new background (e.g. Castle 3 = BGID 0x11):
+       {C.SUCCESS}python sma2_bgid_editor.py sma2.gba set 0x105 0x11{C.RESET}
        {C.INFO}→ Edits sma2.gba directly in-place{C.RESET}
 
-    {opt('4.')} Batch-edit multiple levels at once:
-       {C.SUCCESS}python sma2_bgid_editor.py sma2.gba batch 0x05=0x06 0x06=0x0D{C.RESET}
+    {opt('4.')} Batch-edit multiple sublevels at once:
+       {C.SUCCESS}python sma2_bgid_editor.py sma2.gba batch 0x105=0x11 0x106=0x0D{C.RESET}
 """)
     print(border)
     print()
 
+
 GBA_ROM_BASE      = 0x08000000
 
-# Background ID table — 1 byte per sublevel, indexed by sublevel ID
-# ROM range: 0x0F3B38 - 0x0F3D40  (length 0x209, per ROM map; end address exclusive = 0x0F3D41)
-# Sublevel IDs 0x000-0x208 (521 entries), all lengths in ROM map are hex.
-# Spot-check: sublevel 0x105 -> 0x0F3B38 + 0x105 = 0x0F3C3D (confirmed by friend's ROM edit)
 BGID_TABLE_ADDR   = 0x080F3B38
-BGID_TABLE_OFFSET = BGID_TABLE_ADDR - GBA_ROM_BASE  # 0x0F3B38
-BGID_TABLE_SIZE   = 0x209  # 521 entries: sublevel IDs 0x000-0x208
+BGID_TABLE_OFFSET = BGID_TABLE_ADDR - GBA_ROM_BASE
+BGID_TABLE_SIZE   = 0x209
 
-# Background layout pointer table — 4 bytes per sublevel, indexed by sublevel ID
-# ROM range: 0x0F2AF0 - 0x0F3313  (length 0x824 = 4 * 0x209 entries, per ROM map)
-# Spot-check: sublevel 0x105 -> 0x0F2AF0 + 0x105*4 = 0x0F2F04 (confirmed by friend's ROM edit)
 LAYOUT_TABLE_ADDR   = 0x080F2AF0
-LAYOUT_TABLE_OFFSET = LAYOUT_TABLE_ADDR - GBA_ROM_BASE  # 0x0F2AF0
-LAYOUT_TABLE_SIZE   = 0x209  # 521 entries (one per sublevel, same as BGID table)
+LAYOUT_TABLE_OFFSET = LAYOUT_TABLE_ADDR - GBA_ROM_BASE
 
-# Known vanilla mismatches: sublevel_id -> (bgid, actual_l2_ptr, expected_l2_ptr)
-# These are intentional overrides in the original game — irregular level layouts
-# that use a BGID for graphics but a different background's tilemap layout.
+L1_TABLE_ADDR   = 0x080F22CC
+L1_TABLE_OFFSET = L1_TABLE_ADDR - GBA_ROM_BASE
+
 VANILLA_MISMATCHES = {
-    0x108: (0x0A, 0x080E42D0, 0x080E5190),  # Story intro: Vanilla Dome gfx, Plains tilemap
-    0x112: (0x00, 0x080E4929, 0x080E42D0),  # Unknown:     Plains gfx, Chocolate Island tilemap
+    0x108: (0x0A, 0x080E42D0, 0x080E5190),
+    0x112: (0x00, 0x080E4929, 0x080E42D0),
 }
 
-# Layer 1 data pointer table — 4 bytes per sublevel, indexed by sublevel ID
-# ROM range: 0x0F22CC - 0x0F2AEF  (0x209 entries, 4 bytes each)
-# The Layer 1 data begins with a 7-byte header:
-#   Byte 0: bits 0-4 = length in screens, bits 5-7 = BG palette ID
-#   Byte 1: bits 0-4 = level mode,        bits 5-7 = scroll-related
-#   Byte 2: bits 0-3 = sprite tileset,    bits 4-7 = music index
-#   Byte 3: bits 0-2 = FG palette ID,     bits 3-5 = sprite palette ID, bits 6-7 = timer
-#   Byte 4: bits 0-3 = layer 1/2 tileset ID, bits 4-7 = scroll/item memory
-#   Byte 5: bits 0-3 = scroll-related,    bits 4-7 = BG color ID
-#   Byte 6: unused (always 0x00)
-L1_TABLE_ADDR   = 0x080F22CC
-L1_TABLE_OFFSET = L1_TABLE_ADDR - GBA_ROM_BASE  # 0x0F22CC
-L1_TABLE_SIZE   = 0x209  # same count as BGID table
-
-# Vanilla header presets per BGID — derived from named sublevels in the ROM.
-# Fields: bg_pal, fg_pal, sp_pal, tileset, bg_color
-# These match what the original game uses for each background.
-# Only bg_pal, fg_pal, sp_pal, tileset, bg_color are set automatically;
-# level-specific fields (length, level mode, music, scroll, timer, item memory)
-# are always preserved from the existing header.
 BG_HEADER_PRESETS = {
-    #        bg_pal  fg_pal  sp_pal  tileset  bg_color
     0x00: (    7,      0,      0,      0,       0   ),  # YI Mountains
     0x01: (    4,      2,      3,      9,       8   ),  # Aquatic
-    0x02: (    0,      0,      0,      0,       5   ),  # Athletic / Low Clouds with mountains
+    0x02: (    0,      0,      0,      0,       5   ),  # Athletic / Low Clouds
     0x03: (    0,      6,      0,      0,       6   ),  # Athletic / High Clouds
     0x04: (    0,      0,      0,      0,       1   ),  # Low Mountains
     0x05: (    6,      4,      0,      0,       2   ),  # Chocolate Island Mountains
@@ -177,143 +140,358 @@ BACKGROUNDS = {
 }
 
 LEVEL_NAMES = {
-    # Keys 0x00-0x5A are USER-FACING level IDs.
-    # level_to_sublevel() maps them to the real sublevel ID used in the BGID table.
-    # Sublevel IDs 0x200-0x208 are keyed directly (CI2 extended rooms).
-    0x00: "Bonus game (no-Yoshi intro slot)",  # -> sublevel 0x000 (BGID=0xFF, ghost house intro)
-    0x01: "#1 Iggy's Castle",
-    0x02: "Yoshi's Island 4",
-    0x03: "Yoshi's Island 3",
-    0x04: "Yoshi's House",
-    0x05: "Yoshi's Island 1",
-    0x06: "Yoshi's Island 2",
-    0x07: "Vanilla Ghost House",
-    0x08: "Intro Level",
-    0x09: "Vanilla Secret 1",
-    0x0A: "Vanilla Dome 3",
-    0x0B: "Donut Secret 2",
-    0x0C: "Test Level",
-    0x0D: "Front Door",
-    0x0E: "Back Door",
-    0x0F: "Valley of Bowser 4",
-    0x10: "#7 Larry's Castle",
-    0x11: "Valley Fortress",
-    0x12: "Groovy (no sprites)",
-    0x13: "Valley of Bowser 3",
-    0x14: "Valley Ghost House",
-    0x15: "Valley of Bowser 2",
-    0x16: "Valley of Bowser 1",
-    0x17: "Chocolate Secret",
-    0x18: "Vanilla Dome 2",
-    0x19: "Vanilla Dome 4",
-    0x1A: "Vanilla Dome 1",
-    0x1B: "Red Switch Palace",
-    0x1C: "#3 Lemmy's Castle",
-    0x1D: "Forest Ghost House",
-    0x1E: "Forest of Illusion 1",
-    0x1F: "Forest of Illusion 4",
-    0x20: "Forest of Illusion 2",
-    0x21: "Blue Switch Palace",
-    0x22: "Forest Secret Area",
-    0x23: "Forest of Illusion 3",
-    0x24: "Chocolate Island 2",
-    0x25: "Funky",
-    0x26: "Outrageous",
-    0x27: "Mondo",
-    0x28: "Groovy",
-    0x29: "Yoshi's Island 1 (dup)",
-    0x2A: "Gnarly",
-    0x2B: "Tubular",
-    0x2C: "Way Cool",
-    0x2D: "Awesome",
-    0x2E: "Vanilla Dome 3 (dup)",
-    0x2F: "Donut Secret 2 (dup)",
-    0x30: "Star World 2",
-    0x31: "Front Door (dup)",
-    0x32: "Star World 3",
-    0x33: "Valley of Bowser 4 (dup)",
-    0x34: "Star World 1",
-    0x35: "Star World 4",
-    0x36: "Star World 5",
-    0x37: "Valley of Bowser 3 (dup)",
-    0x38: "Valley Ghost House (dup)",
-    0x39: "Valley of Bowser 2 (dup)",
-    0x3A: "Valley of Bowser 1 (dup)",
-    0x3B: "Chocolate Secret (dup)",
-    0x3C: "Vanilla Dome 2 (dup)",
-    0x3D: "Vanilla Dome 4 (dup)",
-    0x3E: "Vanilla Dome 1 (dup)",
-    0x3F: "Red Switch Palace (dup)",
-    0x40: "#3 Lemmy's Castle (dup)",
-    0x41: "Forest Ghost House (dup)",
-    0x42: "Forest of Illusion 1 (dup)",
-    0x43: "Forest of Illusion 4 (dup)",
-    0x44: "Forest of Illusion 2 (dup)",
-    0x45: "Blue Switch Palace (dup)",
-    0x46: "Forest Secret Area (dup)",
-    0x47: "Forest of Illusion 3 (dup)",
-    0x48: "Test Level",
-    0x49: "Funky (dup)",
-    0x4A: "Outrageous (dup)",
-    0x4B: "Mondo (dup)",
-    0x4C: "Groovy (dup)",
-    0x4D: "Test Level",
-    0x4E: "Gnarly (dup)",
-    0x4F: "Tubular (dup)",
-    0x50: "Way Cool (dup)",
-    0x51: "Awesome (dup)",
-    0x52: "Test Level",
-    0x53: "Test Level",
-    0x54: "Star World 2 (dup)",
-    0x55: "Test Level",
-    0x56: "Star World 3 (dup)",
-    0x57: "Test Level",
-    0x58: "Star World 1 (dup)",
-    0x59: "Star World 4 (dup)",
-    0x5A: "Star World 5 (dup)",
-    0xB7: "Wendy O. Koopa Boss",
-    0xB8: "Lemmy Koopa Boss",
-    0xB9: "Reznor Boss",
-    0xBA: "[CRASH]",
-    0xBB: "Iggy Koopa Boss",
-    0xBC: "Ludwig von Koopa Boss",
-    0xBD: "Roy Koopa Boss",
-    0xBE: "Morton Koopa Jr. Boss",
-    0xBF: "Bowser Boss",
-    0xDF: "1-up Bonus (sale a nivel 13)",
-    0xE0: "1-up Bonus (sale a nivel 23)",
-    0xE1: "Back Door (dup)",
-    0xE2: "Sublevel (Yoshi's Island 4)",
-    0xE3: "Sublevel (Valley of Bowser 4)",
-    0xE4: "Sublevel (Chocolate Secret)",
-    0xE5: "Sublevel (Forest of Illusion 4)",
-    0xE6: "Sublevel (Vanilla Dome 3)",
-    0xE7: "Sublevel (Vanilla Dome 2)",
-    0xE8: "Exit (Gnarly)",
-    0xE9: "Exit (Gnarly)",
-    0xEA: "Sublevel (Donut Secret 2)",
-    0xEB: "Bowser Boss Level",
-    0xEC: "Yoshi Wings Bonus",
-    0xED: "Sublevel (Way Cool)",
-    0xEE: "Sublevel (Yoshi's Island 2)",
-    0xEF: "Sublevel (Yoshi's Island 1)",
-    0xF0: "Front Door - Sublevel 1",
-    0xF1: "Front Door - Sublevel 2",
-    0xF2: "Front Door - Sublevel 3",
-    0xF3: "Front Door - Sublevel 4",
-    0xF4: "Front Door - Sublevel 5",
-    0xF5: "Front Door - Sublevel 6",
-    0xF6: "Front Door - Sublevel 7",
-    0xF7: "Front Door - Sublevel 8",
-    0xF8: "Front Door - Sublevel 9",
-    0xF9: "Exit 1",
-    0xFA: "Exit 2",
-    0xFB: "Blue Switch Exit",
-    0xFC: "Red Switch Exit",
-    0xFD: "Valley Ghost House - Sub 1",
-    0xFE: "Exit (Valley Ghost House)",
-    0xFF: "Valley Ghost House - Sub 2",
-    # CI2 extended sublevels (0x200-0x208) — real ROM table entries
+    # Keys are full sublevel IDs (0x000–0x208).
+    0x000: "Bonus game (no-Yoshi intro slot)",
+    0x001: "Infinite Bonus game",
+    0x002: "Vanilla Secret 2",
+    0x003: "Vanilla Secret 3",
+    0x004: "Top Secret Area",
+    0x005: "Donut Ghost House",
+    0x006: "Donut Plains 3",
+    0x007: "Donut Plains 4",
+    0x008: "#2 Morton's Castle",
+    0x009: "Green Switch Palace",
+    0x00A: "Donut Plains 2",
+    0x00B: "Donut Secret 1",
+    0x00C: "Vanilla Fortress",
+    0x00D: "Butter Bridge 1",
+    0x00E: "Butter Bridge 2",
+    0x00F: "#4 Ludwig's Castle",
+    0x010: "Cheese Bridge Area",
+    0x011: "Cookie Mountain",
+    0x012: "Soda Lake",
+    0x013: "Test Level",
+    0x014: "Donut Secret House",
+    0x015: "Yellow Switch Palace",
+    0x016: "Donut Plains 1",
+    0x017: "Donut Plains 1 (Duplicate)",
+    0x018: "Donut Plains 1 (Duplicate 2)",
+    0x019: "Sunken Ghost Ship",
+    0x01A: "Test Level 2",
+    0x01B: "#6 Wendy's Castle",
+    0x01C: "Chocolate Fortress",
+    0x01D: "Chocolate Island 5",
+    0x01E: "Chocolate Island 4",
+    0x01F: "Test Level 3",
+    0x020: "Forest Fortress",
+    0x021: "#5 Roy's Castle",
+    0x022: "Choco-Ghost House",
+    0x023: "Chocolate Island 1",
+    0x024: "Chocolate Island 3",
+    0x025: "Chocolate Island 2",
+
+    0x026: "",
+    0x027: "",
+    0x028: "",
+    0x029: "",
+    0x02A: "",
+    0x02B: "",
+    0x02C: "",
+    0x02D: "",
+    0x02E: "",
+    0x02F: "",
+    0x030: "",
+    0x031: "",
+    0x032: "",
+    0x033: "",
+    0x034: "",
+    0x035: "",
+    0x036: "",
+    0x037: "",
+    0x038: "",
+    0x039: "",
+    0x03A: "",
+    0x03B: "",
+    0x03C: "",
+    0x03D: "",
+    0x03E: "",
+    0x03F: "",
+    0x040: "",
+    0x041: "",
+    0x042: "",
+    0x043: "",
+    0x044: "",
+    0x045: "",
+    0x046: "",
+    0x047: "",
+    0x048: "",
+    0x049: "",
+    0x04A: "",
+    0x04B: "",
+    0x04C: "",
+    0x04D: "",
+    0x04E: "",
+    0x04F: "",
+    0x050: "",
+    0x051: "",
+    0x052: "",
+    0x053: "",
+    0x054: "",
+    0x055: "",
+    0x056: "",
+    0x057: "",
+    0x058: "",
+    0x059: "",
+    0x05A: "",
+    0x05B: "",
+    0x05C: "",
+    0x05D: "",
+    0x05E: "",
+    0x05F: "",
+    0x060: "",
+    0x061: "",
+    0x062: "",
+    0x063: "",
+    0x064: "",
+    0x065: "",
+    0x066: "",
+    0x067: "",
+    0x068: "",
+    0x069: "",
+    0x06A: "",
+    0x06B: "",
+    0x06C: "",
+    0x06D: "",
+    0x06E: "",
+    0x06F: "",
+    0x070: "",
+    0x071: "",
+    0x072: "",
+    0x073: "",
+    0x074: "",
+    0x075: "",
+    0x076: "",
+    0x077: "",
+    0x078: "",
+    0x079: "",
+    0x07A: "",
+    0x07B: "",
+    0x07C: "",
+    0x07D: "",
+    0x07E: "",
+    0x07F: "",
+    0x080: "",
+    0x081: "",
+    0x082: "",
+    0x083: "",
+    0x084: "",
+    0x085: "",
+    0x086: "",
+    0x087: "",
+    0x088: "",
+    0x089: "",
+    0x08A: "",
+    0x08B: "",
+    0x08C: "",
+    0x08D: "",
+    0x08E: "",
+    0x08F: "",
+    0x090: "",
+    0x091: "",
+    0x092: "",
+    0x093: "",
+    0x094: "",
+    0x095: "",
+    0x096: "",
+    0x097: "",
+    0x098: "",
+    0x099: "",
+    0x09A: "",
+    0x09B: "",
+    0x09C: "",
+    0x09D: "",
+    0x09E: "",
+    0x09F: "",
+    0x0A0: "",
+    0x0A1: "",
+    0x0A2: "",
+    0x0A3: "",
+    0x0A4: "",
+    0x0A5: "",
+    0x0A6: "",
+    0x0A7: "",
+    0x0A8: "",
+    0x0A9: "",
+    0x0AA: "",
+    0x0AB: "",
+    0x0AC: "",
+    0x0AD: "",
+    0x0AE: "",
+    0x0AF: "",
+    0x0B0: "",
+    0x0B1: "",
+    0x0B2: "",
+    0x0B3: "",
+    0x0B4: "",
+    0x0B5: "",
+    0x0B6: "",
+    0x0B7: "Wendy O. Koopa Boss",
+    0x0B8: "Lemmy Koopa Boss",
+    0x0B9: "Reznor Boss",
+    0x0BA: "[CRASH]",
+    0x0BB: "Iggy Koopa Boss",
+    0x0BC: "Ludwig von Koopa Boss",
+    0x0BD: "Roy Koopa Boss",
+    0x0BE: "Morton Koopa Jr. Boss",
+    0x0BF: "Bowser Boss",
+
+    0x0C0: "BONUS STAGE (CI5)",
+    0x0C1: "",
+    0x0C2: "Secret Stage (CBA)",
+    0x0C3: "Secret Stage (CI5)",
+    0x0C4: "",
+    0x0C5: "Secret Stage (DS1)",
+    0x0C6: "Secret Stage (DP4)",
+    0x0C7: "Ghost House Exit",
+    0x0C8: "Welcome to Dinosaourland",
+    0x0C9: "Big Mountains Exit",
+    0x0CA: "Title screen",
+    0x0CB: "Flying Yoshi's Bonus Stage",
+    0x0CC: "Green Switch Palace Room",
+    0x0CD: "Yellow Switch Palace Room",
+    0x0CE: "Big Clouds Exit",
+    0x0CF: "",
+    0x0D0: "CI2 room 4 4+: P-switch",
+    0x0D1: "CI2 room 3 0-229: Bubbled mushrooms",
+    0x0D2: "CI2 room 2 20+: Cape",
+    0x0D3: "",
+    0x0D4: "DP4 Secret Stage",
+    0x0D5: "Wendy's Boss Room",
+    0x0D6: "Castle Before Wendy's Boss Room",
+    0x0D7: "",
+    0x0D8: "CI3 Bonus Room",
+    0x0D9: "Vanilla Secret 1 Bonus Room",
+    0x0DA: "",
+    0x0DB: "",
+    0x0DC: "",
+    0x0DD: "",
+    0x0DE: "",
+    0x0DF: "1-up Bonus (sale a nivel 13)",
+    0x0E0: "1-up Bonus (sale a nivel 23)",
+    0x0E1: "Back Door (dup)",
+    0x0E2: "Sublevel (Yoshi's Island 4)",
+    0x0E3: "Sublevel (Valley of Bowser 4)",
+    0x0E4: "Sublevel (Chocolate Secret)",
+    0x0E5: "Sublevel (Forest of Illusion 4)",
+    0x0E6: "Sublevel (Vanilla Dome 3)",
+    0x0E7: "Sublevel (Vanilla Dome 2)",
+    0x0E8: "Exit (Gnarly)",
+    0x0E9: "Exit (Gnarly)",
+    0x0EA: "Sublevel (Donut Secret 2)",
+    0x0EB: "Bowser Boss Level",
+    0x0EC: "Yoshi Wings Bonus",
+    0x0ED: "Sublevel (Way Cool)",
+    0x0EE: "Sublevel (Yoshi's Island 2)",
+    0x0EF: "Sublevel (Yoshi's Island 1)",
+    0x0F0: "Front Door - Sublevel 1",
+    0x0F1: "Front Door - Sublevel 2",
+    0x0F2: "Front Door - Sublevel 3",
+    0x0F3: "Front Door - Sublevel 4",
+    0x0F4: "Front Door - Sublevel 5",
+    0x0F5: "Front Door - Sublevel 6",
+    0x0F6: "Front Door - Sublevel 7",
+    0x0F7: "Front Door - Sublevel 8",
+    0x0F8: "Front Door - Sublevel 9",
+    0x0F9: "Exit 1",
+    0x0FA: "Exit 2",
+    0x0FB: "Blue Switch Exit",
+    0x0FC: "Red Switch Exit",
+    0x0FD: "Valley Ghost House - Sub 1",
+    0x0FE: "Exit (Valley Ghost House)",
+    0x0FF: "Valley Ghost House - Sub 2",
+
+    0x100: "Bonus game, submaps",
+    0x101: "#1 Iggy's Castle",
+    0x102: "Yoshi's Island 4",
+    0x103: "Yoshi's Island 3",
+    0x104: "Yoshi's House",
+    0x105: "Yoshi's Island 1",
+    0x106: "Yoshi's Island 2",
+    0x107: "Vanilla Ghost House",
+    0x108: "Intro Cutscene",
+    0x109: "Vanilla Secret 1",
+    0x10A: "Vanilla Dome 3",
+    0x10B: "Donut Secret 2",
+    0x10C: "Test Level 4",
+    0x10D: "Front Door (Bowser's Castle)",
+    0x10E: "Back Door (Bowser's Castle)",
+    0x10F: "Valley of Bowser 4",
+    0x110: "#7 Larry's Castle",
+    0x111: "Valley Fortress",
+    0x112: "Test Level 5",
+    0x113: "Valley of Bowser 3",
+    0x114: "Valley Ghost House",
+    0x115: "Valley of Bowser 2",
+    0x116: "Valley of Bowser 1",
+    0x117: "Chocolate Secret",
+    0x118: "Vanilla Dome 2",
+    0x119: "Vanilla Dome 4",
+    0x11A: "Vanilla Dome 1",
+    0x11B: "Red Switch Palace",
+    0x11C: "#3 Lemmy's Switch Palace",
+    0x11D: "Forest Ghost House",
+    0x11E: "Forest of Illusion 1",
+    0x11F: "Forest of Illusion 4",
+    0x120: "Forest of Illusion 2",
+    0x121: "Blue Switch Palace",
+    0x122: "Forest Secret Area",
+    0x123: "Forest of Illusion 3",
+    0x124: "Test Level 6",
+    0x125: "Funky",
+    0x126: "Outrageous",
+    0x127: "Mondo",
+    0x128: "Groovy",
+    0x129: "Test Level 7",
+    0x12A: "Gnarly",
+    0x12B: "Tubular",
+    0x12C: "Way Cool",
+    0x12D: "Awesome",
+    0x12E: "Test Level 8",
+    0x12F: "Test Level 9",
+    0x130: "Star World 2",
+    0x131: "Test Level 10",
+    0x132: "Star World 3",
+    0x133: "Test Level 11",
+    0x134: "Star World 1",
+    0x135: "Star World 4",
+    0x136: "Star World 5",
+    0x137: "Test Level 12",
+    0x138: "Test Level 13",
+    0x139: "Test Level 14",
+    0x13A: "Test Level 15",
+    0x13B: "Test Level 16",
+    0x13C: "",
+    0x13D: "",
+    0x13E: "",
+    0x13F: "",
+    0x140: "",
+    0x141: "",
+    0x142: "",
+    0x143: "",
+    0x144: "",
+    0x145: "",
+    0x146: "",
+    0x147: "",
+    0x148: "",
+    0x149: "",
+    0x14A: "",
+    0x14B: "",
+    0x14C: "",
+    0x14D: "",
+    0x14E: "",
+    0x14F: "",
+    0x150: "",
+    0x151: "",
+    0x152: "",
+    0x153: "",
+    0x154: "",
+    0x155: "",
+    0x156: "",
+    0x157: "",
+    0x158: "",
+    0x159: "",
+    0x15A: "",
+
     0x200: "CI2 room 4: P-switch",
     0x201: "CI2 room 4: Rex goal room",
     0x202: "CI2 room 4: Rex goal room (unused dup of 201)",
@@ -325,55 +503,36 @@ LEVEL_NAMES = {
     0x208: "CI2 room 3: secret exit",
 }
 
-# Sublevel IDs that map directly (not overworld +0x100).
-# This covers:
-#   0x000        – Bonus game main map (level 0x00 is a special case, NOT +0x100)
-#   0x001–0x0B6  – Internal sublevels accessible only by direct sublevel ID
-#   0x0B7–0x0FF  – Boss / special room sublevel IDs
-# Overworld levels 0x01–0x5A map to sublevels 0x101–0x15A (i.e. +0x100).
-DIRECT_SUBLEVEL_IDS = set(range(0x000, 0x100))  # 0x000–0x0FF inclusive
 
-def level_to_sublevel(level_id: int) -> int:
-    """Convert a user-facing level_id to the sublevel_id used in the ROM tables.
- 
-    - 0x00        -> 0x000  (bonus game main map, special case)
-    - 0x01-0x5A   -> level_id + 0x100  (overworld levels)
-    - everything else -> level_id as-is  (bosses, internal rooms)
-    """
-    if level_id == 0x00:
-        return 0x000
-    if 0x01 <= level_id <= 0x5A:
-        return level_id + 0x100
-    return level_id
- 
- 
+def level_name(sublevel_id: int) -> str:
+    name = LEVEL_NAMES.get(sublevel_id, "")
+    if name:
+        return name
+    return f"(sublevel 0x{sublevel_id:03X})"
+
+
 def bgid_desc(bgid: int) -> str:
     if bgid == 0xFF:
         return "Interactive L2 (object data)"
     return BACKGROUNDS.get(bgid, {}).get("desc", "Unknown BGID")
- 
- 
-def level_name(level_id: int) -> str:
-    return LEVEL_NAMES.get(level_id, "Unknown")
- 
- 
+
+
 def get_l2_ptr(data: bytes, sublevel_id: int) -> int:
     off = LAYOUT_TABLE_OFFSET + sublevel_id * 4
     return struct.unpack_from('<I', data, off)[0]
- 
- 
+
+
 def set_l2_ptr(data: bytearray, sublevel_id: int, ptr: int):
     off = LAYOUT_TABLE_OFFSET + sublevel_id * 4
     struct.pack_into('<I', data, off, ptr)
- 
- 
+
+
 def get_l1_ptr(data: bytes, sublevel_id: int) -> int:
     off = L1_TABLE_OFFSET + sublevel_id * 4
     return struct.unpack_from('<I', data, off)[0]
 
 
 def _header_offset(data: bytes, sublevel_id: int) -> int | None:
-    """Return the ROM offset of the 7-byte Level 1 header for this sublevel, or None."""
     gba_ptr = get_l1_ptr(data, sublevel_id)
     if gba_ptr < GBA_ROM_BASE:
         return None
@@ -384,32 +543,29 @@ def _header_offset(data: bytes, sublevel_id: int) -> int | None:
 
 
 def read_header(data: bytes, sublevel_id: int) -> dict | None:
-    """Read the 7-byte sublevel header and return its parsed fields, or None on error."""
     off = _header_offset(data, sublevel_id)
     if off is None:
         return None
     h = data[off:off + 7]
     return {
-        "length":    h[0] & 0x1F,
-        "bg_pal":   (h[0] >> 5) & 0x07,
-        "level_mode": h[1] & 0x1F,
-        "scroll_a":  (h[1] >> 5) & 0x07,
-        "sp_tileset": h[2] & 0x0F,
-        "music":     (h[2] >> 4) & 0x0F,
-        "fg_pal":    h[3] & 0x07,
-        "sp_pal":   (h[3] >> 3) & 0x07,
-        "timer":     (h[3] >> 6) & 0x03,
-        "tileset":   h[4] & 0x0F,
-        "scroll_b":  (h[4] >> 4) & 0x0F,
-        "scroll_c":  h[5] & 0x0F,
-        "bg_color":  (h[5] >> 4) & 0x0F,
-        "unused":    h[6],
-        "_raw":      list(h),
-        "_offset":   off,
+        "length":      h[0] & 0x1F,
+        "bg_pal":     (h[0] >> 5) & 0x07,
+        "level_mode":   h[1] & 0x1F,
+        "scroll_a":   (h[1] >> 5) & 0x07,
+        "sp_tileset":  h[2] & 0x0F,
+        "music":      (h[2] >> 4) & 0x0F,
+        "fg_pal":      h[3] & 0x07,
+        "sp_pal":     (h[3] >> 3) & 0x07,
+        "timer":       (h[3] >> 6) & 0x03,
+        "tileset":     h[4] & 0x0F,
+        "scroll_b":   (h[4] >> 4) & 0x0F,
+        "scroll_c":    h[5] & 0x0F,
+        "bg_color":   (h[5] >> 4) & 0x0F,
+        "unused":      h[6],
+        "_raw":        list(h),
+        "_offset":     off,
     }
 
-
-# ── Palette / color name maps ─────────────────────────────────────────────────
 
 BG_COLOR_NAMES = {
     0: "beige",
@@ -435,8 +591,6 @@ BG_PAL_NAMES = {
 
 
 def _prompt_palette(label: str, names: dict, current: int, max_val: int) -> int:
-    """Show a numbered color menu and prompt the user to pick one.
-    Pressing Enter keeps the current value."""
     print(opt(f"\n  {label}:"))
     for i in range(max_val + 1):
         name   = names.get(i, "?")
@@ -457,39 +611,28 @@ def _prompt_palette(label: str, names: dict, current: int, max_val: int) -> int:
 
 
 def prompt_header_values(data: bytes, sublevel_id: int) -> dict | None:
-    """Interactively ask the user for bg_pal and bg_color.
-    Tileset is derived automatically from the BGID (not asked).
-    fg_pal and sp_pal are not touched.
-    Returns a dict with 'bg_pal' and 'bg_color', or None if header unreadable."""
     hdr = read_header(data, sublevel_id)
     if hdr is None:
         print(err("  Warning: could not read level header — skipping palette prompts."))
         return None
 
-    bg_pal   = _prompt_palette("Background palette", BG_PAL_NAMES,   hdr["bg_pal"],  7)
-    bg_color = _prompt_palette("Back area color",    BG_COLOR_NAMES,  hdr["bg_color"], 7)
+    bg_pal    = _prompt_palette("Background palette", BG_PAL_NAMES,    hdr["bg_pal"],   7)
+    bg_color  = _prompt_palette("Back area color",    BG_COLOR_NAMES,  hdr["bg_color"], 7)
 
     return {"bg_pal": bg_pal, "bg_color": bg_color}
 
 
 def apply_header_values(data: bytearray, sublevel_id: int,
                         bg_pal: int, bg_color: int, bgid: int) -> bool:
-    """Write bg_pal and bg_color into the header.
-    Tileset is auto-set from the BGID preset (same as before).
-    fg_pal and sp_pal are never touched.
-    Returns True on success."""
     off = _header_offset(data, sublevel_id)
     if off is None:
         return False
 
     h = bytearray(data[off:off + 7])
 
-    # Byte 0: preserve bits 0-4 (length), set bits 5-7 (bg_pal)
     h[0] = (h[0] & 0x1F) | ((bg_pal & 0x07) << 5)
-    # Byte 4: preserve bits 4-7 (scroll/item), set bits 0-3 (tileset from BGID)
     tileset = BG_HEADER_PRESETS.get(bgid, (0, 0, 0, 0, 0))[3]
     h[4] = (h[4] & 0xF0) | (tileset & 0x0F)
-    # Byte 5: preserve bits 0-3 (scroll), set bits 4-7 (bg_color)
     h[5] = (h[5] & 0x0F) | ((bg_color & 0x0F) << 4)
 
     data[off:off + 7] = h
@@ -499,48 +642,45 @@ def apply_header_values(data: bytearray, sublevel_id: int,
 def is_vanilla_mismatch(sublevel_id: int, bgid: int, l2_ptr: int) -> bool:
     vm = VANILLA_MISMATCHES.get(sublevel_id)
     return vm is not None and vm[0] == bgid and vm[1] == l2_ptr
- 
- 
+
+
 def check_rom(data: bytes) -> bool:
-    """Validate GBA ROM header: title must contain 'MARIO', game code must be 'AA2E'."""
     if len(data) < 0xB0:
         return False
     title = data[0xA0:0xAC].rstrip(b'\x00')
     code  = data[0xAC:0xB0]
     return b'MARIO' in title.upper() and code == b'AA2E'
- 
- 
+
+
 def out_path_for(rom_path: Path) -> Path:
-    return rom_path  # always write back in-place
- 
- 
-# ── Commands ──────────────────────────────────────────────────────────────────
- 
+    return rom_path
+
+
 def cmd_info():
-    print("\n+-------+------------+------------------------------------------+------+------+------+-------+----------+")
-    print("| BGID  | L2 Tilemap | Description                              | BgPal| FgPal| SpPal|Tileset| BgColor |")
-    print("+-------+------------+------------------------------------------+------+------+------+-------+----------+")
+    print("\n  +-------+------------+------------------------------------------+------+------+------+-------+----------+")
+    print("  | BGID  | L2 Tilemap | Description                              | BgPal| FgPal| SpPal|Tileset| BgColor |")
+    print("  +-------+------------+------------------------------------------+------+------+------+-------+----------+")
     for bgid, info in BACKGROUNDS.items():
         offset = info["ptr"] - GBA_ROM_BASE
         desc   = info["desc"][:42].ljust(42)
         preset = BG_HEADER_PRESETS.get(bgid)
         if preset:
             bg_pal, fg_pal, sp_pal, tileset, bg_color = preset
-            print(f"|  0x{bgid:02X} | 0x{offset:06X}   | {desc} |  {bg_pal}   |  {fg_pal}   |  {sp_pal}   |   {tileset}   |    {bg_color}    |")
+            print(f"  |  0x{bgid:02X} | 0x{offset:06X}   | {desc} |  {bg_pal}   |  {fg_pal}   |  {sp_pal}   |   {tileset}   |    {bg_color}    |")
         else:
-            print(f"|  0x{bgid:02X} | 0x{offset:06X}   | {desc} |  -   |  -   |  -   |   -   |    -    |")
-    print("+-------+------------+------------------------------------------+------+------+------+-------+----------+")
+            print(f"  |  0x{bgid:02X} | 0x{offset:06X}   | {desc} |  -   |  -   |  -   |   -   |    -    |")
+    print("  +-------+------------+------------------------------------------+------+------+------+-------+----------+")
     desc_ff = "Interactive L2 (object data)".ljust(42)
-    print(f"|  0xFF |     ---    | {desc_ff} |  -   |  -   |  -   |   -   |    -    |")
-    print("+-------+------------+------------------------------------------+------+------+------+-------+----------+")
+    print(f"  |  0xFF |     ---    | {desc_ff} |  -   |  -   |  -   |   -   |    -    |")
+    print("  +-------+------------+------------------------------------------+------+------+------+-------+----------+")
     print()
-    print("Intentional vanilla mismatches (original game overrides):")
+    print("  Intentional vanilla mismatches (original game overrides):")
     for sid, (bgid, actual_ptr, expected_ptr) in VANILLA_MISMATCHES.items():
-        print(f"  Sublevel 0x{sid:03X}: BGID=0x{bgid:02X} ({bgid_desc(bgid)})")
-        print(f"              L2 ptr=0x{actual_ptr:08X} (expected: 0x{expected_ptr:08X})")
+        print(f"    Sublevel 0x{sid:03X}: BGID=0x{bgid:02X} ({bgid_desc(bgid)})")
+        print(f"                L2 ptr=0x{actual_ptr:08X} (expected: 0x{expected_ptr:08X})")
     print()
- 
- 
+
+
 def cmd_list(data: bytes, show_raw: bool = False):
     if show_raw:
         print(f"\n  {'Sublvl':>6}  {'Name':<40} {'BGID':>5}  {'L2 Ptr':>10}  {'Status'}")
@@ -564,17 +704,16 @@ def cmd_list(data: bytes, show_raw: bool = False):
             print(f"{marker}[0x{sid:03X}]  {name:<40} 0x{bgid:02X}   0x{l2_ptr:08X}  {status}")
         print()
         return
- 
-    print(f"\n  {'ID':>4}  {'Sublvl':>6}  {'Name':<36} {'BGID':>5}  {'L2 Ptr':>10}  {'Status'}")
-    print("  " + "-" * 100)
-    for level_id in sorted(LEVEL_NAMES.keys()):
-        sublevel_id = level_to_sublevel(level_id)
+
+    print(f"\n  {'Sublvl':>6}  {'Name':<36} {'BGID':>5}  {'L2 Ptr':>10}  {'Status'}")
+    print("  " + "-" * 90)
+    for sublevel_id in sorted(LEVEL_NAMES.keys()):
         toff = BGID_TABLE_OFFSET + sublevel_id
         if toff >= len(data):
             continue
         bgid   = data[toff]
         l2_ptr = get_l2_ptr(data, sublevel_id)
-        name   = level_name(level_id)
+        name   = level_name(sublevel_id)
         status = ""
         if bgid != 0xFF and bgid in BACKGROUNDS:
             expected = BACKGROUNDS[bgid]["ptr"]
@@ -584,22 +723,22 @@ def cmd_list(data: bytes, show_raw: bool = False):
                 else:
                     status = err(f"[MISMATCH! expected 0x{expected:08X}]")
         marker = "  " if bgid != 0xFF else "o "
-        print(f"{marker}0x{level_id:02X}  [0x{sublevel_id:03X}]  {name:<36} 0x{bgid:02X}   0x{l2_ptr:08X}  {status}")
+        print(f"{marker}0x{sublevel_id:03X}  {name:<36} 0x{bgid:02X}   0x{l2_ptr:08X}  {status}")
     print()
- 
- 
-def cmd_get(data: bytes, level_id: int):
-    sublevel_id = level_to_sublevel(level_id)
+
+
+def cmd_get(data: bytes, sublevel_id: int):
     toff = BGID_TABLE_OFFSET + sublevel_id
     if toff >= len(data):
-        print(err(f"Error: sublevel 0x{sublevel_id:03X} out of ROM range."))
+        print(err(f"\n  Error: sublevel 0x{sublevel_id:03X} out of ROM range.\n"))
         return
     bgid   = data[toff]
     l2_ptr = get_l2_ptr(data, sublevel_id)
-    print(f"\n  {info('Level ID')}  : 0x{level_id:02X} -- {level_name(level_id)}")
-    print(f"  {info('Sublevel')}  : 0x{sublevel_id:03X}  (ROM table offset 0x{toff:06X})")
+    print(f"\n  {hdr('─' * 54)}")
+    print(f"  {info('Sublevel')} : 0x{sublevel_id:03X}  ({level_name(sublevel_id)})")
+    print(f"  {info('L1 ptr')}   : 0x{get_l1_ptr(data, sublevel_id):08X}  (ROM 0x{toff:06X})")
     print(f"  {info('BGID')}      : 0x{bgid:02X}  ({bgid_desc(bgid)})")
-    print(f"  {info('L2 ptr')}    : 0x{l2_ptr:08X}  (offset 0x{LAYOUT_TABLE_OFFSET + sublevel_id*4:06X})")
+    print(f"  {info('L2 ptr')}    : 0x{l2_ptr:08X}")
     if bgid != 0xFF and bgid in BACKGROUNDS:
         expected_ptr = BACKGROUNDS[bgid]["ptr"]
         if l2_ptr != expected_ptr:
@@ -610,16 +749,13 @@ def cmd_get(data: bytes, level_id: int):
                 print(err(f"  WARNING   : L2 ptr does not match BGID."))
                 print(err(f"             Expected: 0x{expected_ptr:08X} — may cause corrupt tilemap"))
     print()
- 
- 
-def _apply_bgid_change(data: bytearray, level_id: int, new_bgid: int,
+
+
+def _apply_bgid_change(data: bytearray, sublevel_id: int, new_bgid: int,
                        keep_ptr: bool) -> tuple[bool, str]:
-    """Write BGID and L2 ptr for one level. Returns (success, summary).
-    Header values (bg_pal, bg_color, tileset) are handled separately via prompts."""
     if new_bgid not in BACKGROUNDS and new_bgid != 0xFF:
         return False, f"Invalid BGID 0x{new_bgid:02X}. Use 0x00-0x11 or 0xFF."
 
-    sublevel_id = level_to_sublevel(level_id)
     if sublevel_id >= BGID_TABLE_SIZE:
         return False, (f"Sublevel 0x{sublevel_id:03X} out of table range "
                        f"(max 0x{BGID_TABLE_SIZE-1:03X}).")
@@ -633,7 +769,6 @@ def _apply_bgid_change(data: bytearray, level_id: int, new_bgid: int,
 
     data[toff] = new_bgid
 
-    # Sync L2 tilemap pointer
     if keep_ptr:
         ptr_action = f"  (L2 ptr unchanged: 0x{old_l2ptr:08X})"
     elif new_bgid == 0xFF:
@@ -646,31 +781,28 @@ def _apply_bgid_change(data: bytearray, level_id: int, new_bgid: int,
         else:
             ptr_action = f"  L2 ptr unchanged: 0x{new_l2ptr:08X}"
 
-    name = level_name(level_id)
-    summary = (f"0x{level_id:02X} [sub 0x{sublevel_id:03X}] {name:<36}  "
+    name = level_name(sublevel_id)
+    summary = (f"0x{sublevel_id:03X}  {name:<36}  "
                f"BGID: 0x{old_bgid:02X} -> 0x{new_bgid:02X}  ({bgid_desc(new_bgid)})"
                f"{ptr_action}")
     return True, summary
- 
- 
-def cmd_set(data: bytearray, level_id: int, new_bgid: int,
+
+
+def cmd_set(data: bytearray, sublevel_id: int, new_bgid: int,
             out_path: Path, keep_ptr: bool = False) -> bool:
-    success, msg = _apply_bgid_change(data, level_id, new_bgid, keep_ptr)
+    success, msg = _apply_bgid_change(data, sublevel_id, new_bgid, keep_ptr)
     if not success:
         print(err(f"\n  Error: {msg}\n"))
         return False
 
-    sublevel_id = level_to_sublevel(level_id)
     toff        = BGID_TABLE_OFFSET + sublevel_id
     final_bgid  = data[toff]
     final_l2ptr = get_l2_ptr(data, sublevel_id)
 
-    print(f"\n  {info('Level')}     : 0x{level_id:02X} -- {level_name(level_id)}")
-    print(f"  {info('Sublevel')}  : 0x{sublevel_id:03X}  (ROM offset 0x{toff:06X})")
-    print(f"  {info('BGID')}      -> 0x{final_bgid:02X}  ({bgid_desc(final_bgid)})")
-    print(f"  {info('L2 ptr')}    -> 0x{final_l2ptr:08X}" + (opt("  [--keep-ptr]") if keep_ptr else ""))
+    print(f"\n  {ok('✓')} Sublevel 0x{sublevel_id:03X}  ({level_name(sublevel_id)})")
+    print(f"    {info('BGID')}      -> 0x{final_bgid:02X}  ({bgid_desc(final_bgid)})")
+    print(f"    {info('L2 ptr')}    -> 0x{final_l2ptr:08X}" + (opt("  [--keep-ptr]") if keep_ptr else ""))
 
-    # Interactive palette/color prompts (skip for BGID=0xFF interactive L2)
     if new_bgid != 0xFF:
         values = prompt_header_values(data, sublevel_id)
         if values is not None:
@@ -688,13 +820,13 @@ def cmd_set(data: bytearray, level_id: int, new_bgid: int,
     out_path.write_bytes(bytes(data))
     print(ok(f"\n  Modified in-place: {out_path}\n"))
     return True
- 
- 
+
+
 def cmd_batch(data: bytearray, changes: list, out_path: Path, keep_ptr: bool = False):
     applied = 0
     print()
-    for level_id, new_bgid in changes:
-        ok_flag, msg = _apply_bgid_change(data, level_id, new_bgid, keep_ptr)
+    for sublevel_id, new_bgid in changes:
+        ok_flag, msg = _apply_bgid_change(data, sublevel_id, new_bgid, keep_ptr)
         status = ok("OK  ") if ok_flag else err("SKIP")
         print(f"  {status} {msg}")
         if ok_flag:
@@ -704,52 +836,13 @@ def cmd_batch(data: bytearray, changes: list, out_path: Path, keep_ptr: bool = F
         print(ok(f"\n  {applied} change(s) applied. Modified in-place: {out_path}\n"))
     else:
         print(err("  No changes applied.\n"))
- 
- 
-# ── CLI ───────────────────────────────────────────────────────────────────────
- 
-USAGE = """
-Usage:
-  python sma2_bgid_editor.py <rom.gba> <command> [args...] [options]
- 
-Commands:
-  info                           List all 18 backgrounds with their tileset presets
-  list [--raw]                   List levels with their current BGID and L2 ptr
-  get  <level_id>                Show BGID, L2 ptr, and header for a level
-  get-header <level_id>          Show full parsed header fields for a level
-  set  <level_id> <new_bgid>     Change BGID, L2 ptr, and interactively set
-                                   background palette and back area color.
-                                   Tileset is auto-set from the BGID.
-                                   fg_pal and sp_pal are never touched.
-  batch <lvl=bgid> [lvl=bgid...] Change multiple levels in one pass (no prompts)
- 
-Options:
-  --keep-ptr    Only update the BGID byte; leave the L2 pointer untouched.
- 
-Notes on level_id:
-  - 0x00       -> sublevel 0x000  (Bonus game, special case)
-  - 0x01-0x5A  -> sublevel = level_id + 0x100  (overworld levels)
-  - 0xB7-0xFF  -> sublevel = level_id  (bosses / special rooms)
- 
-Output: same .gba file modified in-place
- 
-Examples:
-  python sma2_bgid_editor.py sma2.gba info
-  python sma2_bgid_editor.py sma2.gba list
-  python sma2_bgid_editor.py sma2.gba get 0x05
-  python sma2_bgid_editor.py sma2.gba get-header 0x05
-  python sma2_bgid_editor.py sma2.gba set 0x05 0x11
-  python sma2_bgid_editor.py sma2.gba set 0x05 0x11 --keep-ptr
-  python sma2_bgid_editor.py sma2.gba batch 0x05=0x11 0x06=0x0A 0x07=0x00
-"""
- 
- 
-def cmd_get_header(data: bytes, level_id: int):
-    sublevel_id = level_to_sublevel(level_id)
+
+
+def cmd_get_header(data: bytes, sublevel_id: int):
     hdr = read_header(data, sublevel_id)
     l1_ptr = get_l1_ptr(data, sublevel_id)
-    print(f"\n  {info('Level')}    : 0x{level_id:02X} -- {level_name(level_id)}")
-    print(f"  {info('Sublevel')} : 0x{sublevel_id:03X}")
+    print(f"\n  {hdr('─' * 54)}")
+    print(f"  {info('Sublevel')} : 0x{sublevel_id:03X}  ({level_name(sublevel_id)})")
     print(f"  {info('L1 ptr')}   : 0x{l1_ptr:08X}")
     if hdr is None:
         print(err("  Header   : could not be read (invalid L1 pointer?)"))
@@ -772,64 +865,143 @@ def cmd_get_header(data: bytes, level_id: int):
 
 def parse_hex(s: str) -> int:
     return int(s.strip(), 16)
- 
- 
+
+
+def print_advanced_help():
+    border = f"{C.INFO}  {'─' * 52}{C.RESET}"
+    print(f"""
+{border}
+  {hdr('Commands')}
+{border}
+
+  {info('info')}
+     List all 18 backgrounds with their tileset presets.
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba info{C.RESET}
+
+  {info('list [--raw]')}
+     List all named sublevels with their current BGID and L2 ptr.
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba list{C.RESET}
+     {C.HEADER}→ Shows only named sublevels (those with a known name).{C.RESET}
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba list --raw{C.RESET}
+     {C.HEADER}→ Dumps all 521 sublevel slots (0x000–0x208), including unnamed.{C.RESET}
+
+  {info('get <sublevel_id>')}
+     Show BGID, L2 ptr, and header info for a single sublevel.
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba get 0x105{C.RESET}
+     {C.HEADER}→ Shows BGID, L2 pointer, and flags mismatches.{C.RESET}
+
+  {info('get-header <sublevel_id>')}
+     Show full parsed 7-byte header fields for a sublevel.
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba get-header 0x105{C.RESET}
+     {C.HEADER}→ Shows length, bg_pal, level_mode, tileset, bg_color, etc.{C.RESET}
+
+  {info('set <sublevel_id> <new_bgid> [--keep-ptr]')}
+     Change BGID and L2 pointer, interactively set palette and color.
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba set 0x105 0x11{C.RESET}
+     {C.HEADER}→ Changes sublevel 0x105 (Yoshi's Island 1) to Castle 3 background.{C.RESET}
+     {C.HEADER}→ Prompts for background palette and back area color.{C.RESET}
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba set 0x105 0x11 --keep-ptr{C.RESET}
+     {C.HEADER}→ Same but preserves the existing L2 pointer.{C.RESET}
+
+  {info('batch <sub=bgid> [sub=bgid...] [--keep-ptr]')}
+     Change multiple sublevels in one pass. No interactive prompts.
+     {C.SUCCESS}python sma2_bgid_editor.py sma2.gba batch 0x105=0x11 0x106=0x0D{C.RESET}
+     {C.HEADER}→ Changes multiple sublevels at once.{C.RESET}
+
+{border}
+  {info('Options')}
+{border}
+
+  {opt('--keep-ptr')}
+     Only update the BGID byte; leave the L2 tilemap pointer untouched.
+     Useful to replicate intentional vanilla overrides.
+
+{border}
+  {info('Background Palette')}
+{border}
+
+  0 = green       4 = strong purple (unused)
+  1 = blue        5 = dark gray
+  2 = beige       6 = dark brown
+  3 = brown       7 = default green
+
+{border}
+  {info('Back Area Color')}
+{border}
+
+  0 = beige       4 = dark green
+  1 = light green 5 = dark blue
+  2 = blue        6 = light blue
+  3 = black       7 = white
+
+{border}
+""")
+    print()
+
+
 def main():
     if len(sys.argv) < 3:
         print_banner()
-        print(""); sys.exit(1)
- 
-    rom_path    = Path(sys.argv[1])
-    command     = sys.argv[2].lower()
-    keep_ptr    = "--keep-ptr" in sys.argv
- 
+        print("")
+        sys.exit(1)
+
+    rom_path = Path(sys.argv[1])
+    command  = sys.argv[2].lower()
+
+    if command in ("help", "--help", "-h", "advanced"):
+        print_advanced_help()
+        sys.exit(0)
+
     if command == "info":
-        cmd_info(); return
- 
+        if not rom_path.exists():
+            print(err(f"Error: '{rom_path}' not found.")); sys.exit(1)
+        cmd_info()
+        return
+
     if not rom_path.exists():
         print(err(f"Error: '{rom_path}' not found.")); sys.exit(1)
- 
+
     raw = rom_path.read_bytes()
     if not check_rom(raw):
-        print(err("Warning: file does not look like an SMA2 ROM. Continuing anyway..."))
+        print(err("Warning: file does not look like an SMA2 ROM. Continuing..."))
     if len(raw) < BGID_TABLE_OFFSET + BGID_TABLE_SIZE:
         print(err(f"Error: ROM too small ({len(raw)} bytes).")); sys.exit(1)
- 
+
     out = out_path_for(rom_path)
- 
+
     if command == "list":
         cmd_list(raw, show_raw="--raw" in sys.argv[3:])
- 
+
     elif command == "get":
         if len(sys.argv) < 4:
-            print(err("Usage: get <level_id>")); sys.exit(1)
+            print(err("Usage: get <sublevel_id>")); sys.exit(1)
         try:
             cmd_get(raw, parse_hex(sys.argv[3]))
         except ValueError:
-            print(err(f"Error: invalid level_id '{sys.argv[3]}'")); sys.exit(1)
+            print(err(f"Error: invalid sublevel_id '{sys.argv[3]}'")); sys.exit(1)
 
     elif command == "get-header":
         if len(sys.argv) < 4:
-            print(err("Usage: get-header <level_id>")); sys.exit(1)
+            print(err("Usage: get-header <sublevel_id>")); sys.exit(1)
         try:
             cmd_get_header(raw, parse_hex(sys.argv[3]))
         except ValueError:
-            print(err(f"Error: invalid level_id '{sys.argv[3]}'")); sys.exit(1)
- 
+            print(err(f"Error: invalid sublevel_id '{sys.argv[3]}'")); sys.exit(1)
+
     elif command == "set":
         if len(sys.argv) < 5:
-            print(err("Usage: set <level_id> <new_bgid>")); sys.exit(1)
+            print(err("Usage: set <sublevel_id> <new_bgid>")); sys.exit(1)
         try:
-            lid  = parse_hex(sys.argv[3])
+            sid  = parse_hex(sys.argv[3])
             bgid = parse_hex(sys.argv[4])
         except ValueError as e:
             print(err(f"Error: {e}")); sys.exit(1)
         data = bytearray(raw)
-        cmd_set(data, lid, bgid, out, keep_ptr=keep_ptr)
- 
+        cmd_set(data, sid, bgid, out, keep_ptr="--keep-ptr" in sys.argv)
+
     elif command == "batch":
         if len(sys.argv) < 4:
-            print(err("Usage: batch lvl=bgid [lvl=bgid ...]")); sys.exit(1)
+            print(err("Usage: batch sub=bgid [sub=bgid ...]")); sys.exit(1)
         changes = []
         for pair in sys.argv[3:]:
             if pair.startswith("--"):
@@ -842,12 +1014,14 @@ def main():
             except ValueError:
                 print(err(f"  SKIP: invalid values '{pair}'"))
         data = bytearray(raw)
-        cmd_batch(data, changes, out, keep_ptr=keep_ptr)
- 
+        cmd_batch(data, changes, out, keep_ptr="--keep-ptr" in sys.argv)
+
     else:
-        print(err(f"Unknown command: '{command}'"))
-        print(""); sys.exit(1)
- 
- 
+        print(err(f"\n  Unknown command: '{command}'"))
+        print(f"  Run without arguments to see the main commands.")
+        print(f"  Run with 'help' to see all advanced commands.\n")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
